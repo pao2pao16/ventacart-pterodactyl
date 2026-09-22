@@ -87,4 +87,8 @@ IGNORE
 # owns its directory, so the files are handed to that same owner.
 chown -R "$(stat -c '%u:%g' /mnt/server)" /mnt/server
 
-say "Installed. Start the server to finish setting it up."
+# Printed so the console itself says which install ran and what it left
+# behind: a store trimmed of the unused Google services is about 80 MB,
+# an untrimmed one about 270 MB.
+say "Installed: $(du -sh /mnt/server 2>/dev/null | cut -f1) on disk, vendor $(du -sh /mnt/server/vendor 2>/dev/null | cut -f1), google $(du -sh /mnt/server/vendor/google 2>/dev/null | cut -f1)."
+say "Start the server to finish setting it up."
