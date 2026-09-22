@@ -65,6 +65,8 @@ say "Building the storefront's CSS and JS ..."
 export npm_config_cache=/tmp/npm npm_config_update_notifier=false
 npm ci --no-audit --no-fund --loglevel=error
 npm run build
+# The build is all that is needed at run time. node_modules is a few hundred
+# MB; the cache lives in /tmp here and never reaches the server's disk.
 rm -rf node_modules
 # Tells the first start this build matches the code, so it is not built twice.
 git rev-parse HEAD > .runtime/build-commit

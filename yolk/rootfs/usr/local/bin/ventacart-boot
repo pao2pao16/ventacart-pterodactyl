@@ -43,8 +43,10 @@ build_assets() {
     say "Building the storefront's CSS and JS ..."
     export npm_config_cache="$APP/.cache/npm" npm_config_update_notifier=false
     npm ci --no-audit --no-fund --loglevel=error >/dev/null && npm run build >/dev/null || return 1
-    # Only the build is needed at run time. node_modules is a few hundred MB.
-    rm -rf node_modules
+    # Only the build is needed at run time. node_modules is a few hundred MB
+    # and npm's package cache about 100 MB: both are the server's disk, and
+    # a rebuild fetches what it needs again.
+    rm -rf node_modules "$npm_config_cache"
     echo "$head" > .runtime/build-commit
 }
 
