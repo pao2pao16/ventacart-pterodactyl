@@ -44,6 +44,19 @@ export COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_HOME=/tmp/composer
 composer install --no-dev --no-scripts --no-interaction --prefer-dist \
     --optimize-autoloader --no-progress
 
+# Drops the Google API services this store does not use: the package ships
+# 640 of them (184 MB) and VentaCart speaks to one. A Composer script, which
+# --no-scripts above keeps from running on its own, so it is called here and
+# the autoloader is written again over what is left.
+# Tolerated, not required: a branch whose composer.json has no such script
+# installs fine, it is only bigger.
+if composer run-script pre-autoload-dump --no-interaction; then
+    say "Trimmed unused dependencies."
+    composer dump-autoload --no-dev --optimize --no-scripts --no-interaction
+else
+    say "No dependency trim in this branch; carrying on."
+fi
+
 mkdir -p .runtime/tmp .runtime/nginx \
          storage/framework/cache/data storage/framework/sessions storage/framework/views \
          storage/logs bootstrap/cache

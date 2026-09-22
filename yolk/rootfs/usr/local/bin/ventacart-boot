@@ -83,8 +83,16 @@ sed -e "s|__PORT__|${SERVER_PORT:-8080}|g" /etc/ventacart/nginx.conf.tpl > "$RUN
 if [ "${AUTO_UPDATE:-0}" = "1" ] && [ -d .git ]; then
     say "Updating to the latest ${GIT_BRANCH:-main} ..."
     if with_token git fetch --depth 1 origin "${GIT_BRANCH:-main}" && git reset --hard FETCH_HEAD; then
-        composer install --no-dev --no-scripts --no-interaction --prefer-dist \
-            --optimize-autoloader --no-progress || fail "composer install failed after the update."
+        if composer install --no-dev --no-scripts --no-interaction --prefer-dist \
+               --optimize-autoloader --no-progress; then
+            # As the install does: drop the Google API services this store
+            # does not use, then write the autoloader over what is left.
+            if composer run-script pre-autoload-dump --no-interaction >/dev/null 2>&1; then
+                composer dump-autoload --no-dev --optimize --no-scripts --no-interaction >/dev/null
+            fi
+        else
+            fail "composer install failed after the update."
+        fi
     else
         warn "The update could not be fetched; starting the code already here."
     fi
