@@ -1,0 +1,166 @@
+#!/bin/bash
+# Runs on every start of the server: brings VentaCart in /home/container up to
+# date with this server's settings, then hands over to ventacart-run.
+#
+# Every setting the egg exposes arrives as a real environment variable, and
+# Laravel reads those ahead of .env. So .env holds only what has to be
+# generated once and kept, which is APP_KEY.
+
+set -uo pipefail
+
+APP=/home/container
+RUN=/tmp/ventacart
+cd "$APP" || exit 1
+
+say()  { printf '\033[1;36m[ventacart]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[ventacart]\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31m[ventacart]\033[0m %s\n' "$*"; sleep 5; exit 1; }
+
+artisan() { php "$APP/artisan" "$@" --no-interaction; }
+
+# The token rides in git's environment, never on a command line and never in
+# .git/config, so it is gone the moment this process is.
+with_token() {
+    if [ -n "${GIT_TOKEN:-}" ]; then
+        GIT_CONFIG_COUNT=1 \
+        GIT_CONFIG_KEY_0=http.extraHeader \
+        GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 -w0)" \
+        "$@"
+    else
+        "$@"
+    fi
+}
+
+# The storefront's CSS and JS are built on the server: the repository does
+# not commit public/build, and a checkout without it is a store with no
+# styles. Built again only when the code has changed since the last build.
+build_assets() {
+    local head
+    head=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+    if [ -f public/build/manifest.json ] && [ "$(cat .runtime/build-commit 2>/dev/null)" = "$head" ]; then
+        return 0
+    fi
+    say "Building the storefront's CSS and JS ..."
+    export npm_config_cache="$APP/.cache/npm" npm_config_update_notifier=false
+    npm ci --no-audit --no-fund --loglevel=error >/dev/null && npm run build >/dev/null || return 1
+    # Only the build is needed at run time. node_modules is a few hundred MB.
+    rm -rf node_modules
+    echo "$head" > .runtime/build-commit
+}
+
+[ -f artisan ] || fail "No VentaCart in /home/container. Reinstall the server from the panel and watch the console for the install's own messages."
+[ "$(id -u)" = "0" ] && warn "Running as root. Wings normally starts servers as its own user."
+[ -w storage ] || fail "storage/ is not writable by uid $(id -u). Reinstall the server so Wings sets the owner."
+
+missing=()
+for key in APP_URL DB_HOST DB_DATABASE DB_USERNAME DB_PASSWORD; do
+    [ -n "${!key:-}" ] || missing+=("$key")
+done
+[ ${#missing[@]} -eq 0 ] || fail "Set these first, under Admin, Servers, this server, Startup: ${missing[*]}"
+
+# .env.example is written for a developer's machine (sqlite, debug on). The
+# egg's own variables override it; these cover what the egg does not ask.
+export APP_ENV="${APP_ENV:-production}" \
+       APP_DEBUG="${APP_DEBUG:-false}" \
+       DB_CONNECTION="${DB_CONNECTION:-mysql}" \
+       DB_PORT="${DB_PORT:-3306}" \
+       LOG_LEVEL="${LOG_LEVEL:-warning}"
+
+# php-fpm refuses to start with fewer workers than its spare servers (up to
+# 3), so a smaller number is raised rather than left to stop the server.
+export FPM_WORKERS="${FPM_WORKERS:-6}"
+if ! [[ "$FPM_WORKERS" =~ ^[0-9]+$ ]] || [ "$FPM_WORKERS" -lt 4 ]; then
+    say "PHP workers raised from ${FPM_WORKERS} to 4, the fewest php-fpm starts with."
+    FPM_WORKERS=4
+fi
+
+mkdir -p "$RUN" .runtime/tmp .runtime/nginx \
+         storage/framework/cache/data storage/framework/sessions storage/framework/views \
+         storage/logs bootstrap/cache
+
+sed -e "s|__PORT__|${SERVER_PORT:-8080}|g" /etc/ventacart/nginx.conf.tpl > "$RUN/nginx.conf"
+
+if [ "${AUTO_UPDATE:-0}" = "1" ] && [ -d .git ]; then
+    say "Updating to the latest ${GIT_BRANCH:-main} ..."
+    if with_token git fetch --depth 1 origin "${GIT_BRANCH:-main}" && git reset --hard FETCH_HEAD; then
+        composer install --no-dev --no-scripts --no-interaction --prefer-dist \
+            --optimize-autoloader --no-progress || fail "composer install failed after the update."
+    else
+        warn "The update could not be fetched; starting the code already here."
+    fi
+fi
+
+build_assets || fail "The storefront's CSS and JS did not build. The server may need more memory."
+
+[ -f .env ] || { cp .env.example .env && say "Created .env"; }
+if ! grep -q '^APP_KEY=base64:' .env; then
+    artisan key:generate --force >/dev/null || fail "Could not generate APP_KEY."
+fi
+
+# Compiled caches from the last start are removed as files rather than through
+# optimize:clear, which also clears the cache store: on a first start that
+# store is a table the migrations have not created yet.
+rm -f bootstrap/cache/config.php bootstrap/cache/routes-v7.php bootstrap/cache/events.php \
+      bootstrap/cache/services.php bootstrap/cache/packages.php
+find storage/framework/views -name '*.php' -delete
+
+artisan package:discover >/dev/null || fail "VentaCart did not boot. See storage/logs/laravel.log."
+[ -e public/storage ] || artisan storage:link >/dev/null
+
+# Brand new database, or a store that has been running? Asked before any
+# migration runs, so the answer is about the database as it was found.
+#
+#   fresh     no migration has ever run here: set the store up.
+#   partial   migrations ran but there are no users: a first start that
+#             stopped partway. Not carried on. VentaCart tells a new database
+#             from a running store by every migration having run in one
+#             batch, so a second attempt reads as a running store and sets
+#             the extensions from choices nobody made.
+#   existing  a store with people in it: never re-seeded, its admin never
+#             replaced.
+state=$(artisan tinker --execute='try { DB::connection()->getPdo(); $ran = Schema::hasTable("migrations") && DB::table("migrations")->exists(); $people = Schema::hasTable("users") && DB::table("users")->exists(); echo "STATE=", ! $ran ? "fresh" : ($people ? "existing" : "partial"); } catch (Throwable $e) { echo "STATE=nodb ", $e->getMessage(); }' 2>&1 | grep -o 'STATE=.*' | tail -n1)
+state=${state#STATE=}
+
+case "$state" in
+partial)
+    fail "An earlier first start stopped partway, and a store can only be set up on an empty database. In this server's Databases tab, delete the database and create it again, copy its new password into Admin, Servers, this server, Startup, then start again."
+    ;;
+fresh)
+    say "New store: installing VentaCart ..."
+    artisan migrate --force || fail "Migrations failed; the reason is just above. The database now holds a half-built store: empty it (Databases tab, delete and create again) before the next start."
+    artisan db:seed --force || fail "Seeding failed; the reason is just above."
+    # The seeder's first admin comes with a known password. It is replaced
+    # at once with the one this server was created with, so there is never
+    # an admin / password login.
+    updated=$(artisan tinker --execute='echo "UPDATED=", DB::table("users")->where("username", "admin")->update(["email" => getenv("ADMIN_EMAIL"), "password" => Hash::make(getenv("ADMIN_PASSWORD"))]);' 2>&1 | grep -o 'UPDATED=[0-9]*' | tail -n1)
+    [ "$updated" = "UPDATED=1" ] || fail "Could not set the admin's email and password."
+    say "Sign in to the admin as admin, with the password set on this server. Its email is ${ADMIN_EMAIL}."
+    ;;
+existing)
+    # A running store is never migrated behind its owner's back. Some of
+    # VentaCart's migrations cannot be undone, and a store may owe one-off
+    # commands before them. So pending ones are reported, and run only when
+    # this server has been told to, or when someone types migrate here.
+    if ! artisan migrate:status --pending=1 >/dev/null 2>&1; then
+        count=$(artisan migrate:status --pending 2>/dev/null | grep -c 'Pending')
+        if [ "${AUTO_MIGRATE:-0}" = "1" ]; then
+            say "Running ${count} new migration(s) ..."
+            artisan migrate --force || fail "Migrations failed. The store's data is as it was before the failing one."
+        else
+            warn "${count} migration(s) are waiting and have NOT been run. Read the release notes for this update, then type: migrate --force"
+        fi
+    fi
+    ;;
+*)
+    fail "Cannot reach the database (${state#nodb }). Check the database settings under Admin, Servers, this server, Startup."
+    ;;
+esac
+
+# Config, routes, events and views compiled once per start. A failure here is
+# not fatal: VentaCart runs uncached, only slower.
+if ! artisan optimize >/dev/null 2>&1; then
+    warn "Could not build the caches; running without them. See storage/logs/laravel.log."
+    rm -f bootstrap/cache/config.php bootstrap/cache/routes-v7.php bootstrap/cache/events.php
+fi
+
+exec /usr/local/bin/ventacart-run

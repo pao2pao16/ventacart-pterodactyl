@@ -1,0 +1,48 @@
+name: yolk
+
+# Builds the runtime image for both amd64 and arm64 nodes and publishes it to
+# ghcr.io/<owner>/ventacart-yolk. Runs when the image's files change, or by hand
+# from the Actions tab.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "yolk/**"
+      - ".github/workflows/yolk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php: ["8.4"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: yolk
+          platforms: linux/amd64,linux/arm64
+          build-args: PHP_VERSION=${{ matrix.php }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/ventacart-yolk:php${{ matrix.php }}
+            ghcr.io/${{ github.repository_owner }}/ventacart-yolk:php${{ matrix.php }}-${{ github.sha }}
+          cache-from: type=gha,scope=php${{ matrix.php }}
+          cache-to: type=gha,mode=max,scope=php${{ matrix.php }}

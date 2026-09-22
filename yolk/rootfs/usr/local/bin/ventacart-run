@@ -1,0 +1,114 @@
+#!/bin/bash
+# The one process Wings watches.
+#
+# Pterodactyl expects a single long-running process whose stdout is the
+# console and whose stdin is where the panel types. VentaCart needs four: the
+# web server, PHP, the queue worker (order emails, notifications) and the
+# scheduler (currency rates, stock alerts, courier tracking, the sitemap).
+# This script starts each, starts it again if it dies, and passes whatever
+# is typed in the console to artisan.
+#
+# Every service writes to the output it inherits from here rather than
+# opening /dev/stdout by path, which an unprivileged user cannot always do.
+
+set -u
+
+APP=/home/container
+RUN=/tmp/ventacart
+PORT="${SERVER_PORT:-8080}"
+
+say() { printf '\033[1;36m[ventacart]\033[0m %s\n' "$*"; }
+
+rm -f "$RUN"/*.pid "$RUN/stopping"
+
+declare -a LOOPS=()
+
+# Keeps one service running. The service's own pid is written where stop()
+# can find it; the loop gives up as soon as a stop has begun.
+keep() {
+    local name=$1; shift
+    (
+        while :; do
+            "$@" </dev/null &
+            echo $! > "$RUN/$name.pid"
+            wait $!
+            local code=$?
+            [ -e "$RUN/stopping" ] && exit 0
+            # A clean exit is routine: the queue worker leaves every hour on
+            # purpose so its memory starts fresh. Only a failure is announced.
+            if [ $code -ne 0 ]; then
+                say "$name stopped (exit $code). Starting it again in 3 seconds."
+                sleep 3
+            else
+                sleep 1
+            fi
+            [ -e "$RUN/stopping" ] && exit 0
+        done
+    ) &
+    LOOPS+=($!)
+}
+
+stopping=0
+stop() {
+    [ $stopping -eq 1 ] && return
+    stopping=1
+    say "Stopping ..."
+    touch "$RUN/stopping"
+    for f in "$RUN"/*.pid; do
+        [ -e "$f" ] && kill -TERM "$(cat "$f")" 2>/dev/null
+    done
+    wait "${LOOPS[@]}" 2>/dev/null
+    say "Stopped."
+    exit 0
+}
+trap stop INT TERM
+
+keep php-fpm   php-fpm -F -y /etc/ventacart/php-fpm.conf
+# nginx only once PHP is listening, so the first request is never answered
+# with a failed connection to a socket that does not exist yet.
+for _ in $(seq 1 30); do [ -S "$RUN/php-fpm.sock" ] && break; sleep 1; done
+keep nginx     nginx -p "$RUN" -e stderr -c "$RUN/nginx.conf" -g 'daemon off;'
+keep queue     php "$APP/artisan" queue:work --sleep=3 --tries=3 --max-time=3600
+keep scheduler php "$APP/artisan" schedule:work
+
+# Online means the storefront actually answers, through nginx, PHP, Laravel
+# and the database, not merely that the processes exist.
+ready=0
+for _ in $(seq 1 90); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:${PORT}/" || true)
+    case "$code" in
+        2??|3??) ready=1; break ;;
+    esac
+    sleep 1
+done
+if [ $ready -eq 1 ]; then
+    say "VentaCart is ready on port ${PORT}"
+else
+    say "The storefront did not answer on port ${PORT} (last status: ${code:-none}). See storage/logs/laravel.log."
+fi
+say "Type an artisan command here, for example migrate:status. Type stop to shut down."
+
+# The console. A line is an artisan command and nothing else. The command's
+# own stdin is /dev/null, so nothing it runs can take over the console.
+while :; do
+    if IFS= read -r -t 2 line; then
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [ -z "$line" ] && continue
+        case "$line" in
+            stop|exit|quit) stop ;;
+            "php artisan "*) line="${line#php artisan }" ;;
+            "artisan "*)     line="${line#artisan }" ;;
+        esac
+        read -r -a args <<< "$line"
+        php "$APP/artisan" "${args[@]}" --no-interaction </dev/null
+    else
+        rc=$?
+        # A timeout only means nobody typed. Anything else means stdin has
+        # closed, so from here the services are simply waited on.
+        if [ $rc -le 128 ]; then
+            wait "${LOOPS[@]}"
+            exit 0
+        fi
+    fi
+done
